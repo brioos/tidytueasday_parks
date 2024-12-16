@@ -1,0 +1,309 @@
+---
+title: "parks_tidytuesday"
+output: html_document
+date: "2024-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(stringi)
+library(ggrepel)
+library(lmtest)
+```
+
+## Read data with tidytueasday package
+
+```{r}
+tuesdata <- tidytuesdayR::tt_load('2021-06-22')
+tuesdata <- tidytuesdayR::tt_load(2021, week = 26)
+
+parks <- tuesdata$parks
+
+```
+## EDA
+
+```{r}
+#quick overview
+summary(parks)
+
+#transform into numeric values, get rid of non-numeric additional characters
+parks <- parks %>% 
+  filter(year == 2020) %>%
+  mutate(spend_per_resident_data = as.numeric(gsub("[^0-9.]", "", spend_per_resident_data)),
+         park_pct_city_data= as.numeric(gsub("[^0-9.]", "", park_pct_city_data)))
+
+#get and plot distribution of all numeric vars
+continuous_vars <- parks %>%
+  select(where(is.numeric)) %>%
+  names()
+
+for (var in continuous_vars) {
+  print(ggplot(data = parks, aes_string(x = var)) +
+      geom_histogram() +
+      theme_minimal())
+}
+
+
+```
+
+## Visualisations
+
+Prepare and join data with long and lat data form the world database
+
+```{r}
+#maps
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+data("world.cities", package = "maps")
+
+#USA limits
+x_limits <- c(-125, -65)
+y_limits <- c(25, 50)
+
+#this is the data of all cities in the world, transform to lower case to match with our data
+varosok <- world.cities %>% 
+  mutate(name = (stri_trans_general(stri_trans_tolower(name), "Latin-ASCII"))) %>% 
+  filter(country.etc == "USA")
+
+#transform to lower case
+park_varos <- parks %>% 
+  mutate(city = (stri_trans_general(stri_trans_tolower(city), "Latin-ASCII")))
+
+proba_merge <- varosok %>%
+  left_join(park_varos, by = c("name" = "city")) %>% 
+  filter(!is.na(rank))
+```
+
+Correct coding errors
+
+```{r}
+unmatched <- anti_join(park_varos, varosok, by = c("city" = "name"))
+unmatched
+
+park_varos <- park_varos %>%
+  mutate(city = case_when(
+    city == "washington, d.c." ~ "washington",
+    city == "st. paul" ~ "saint paul",
+    city == "arlington, virginia" ~ "arlington",
+    city == "st. louis" ~ "saint louis",
+    city == "st. petersburg" ~ "saint petersburg",
+    city == "boise" ~ "boise city",
+    city == "arlington, texas" ~ "arlington",
+    city == "charlotte/mecklenburg county" ~ "charlotte",
+    TRUE ~ city))
+
+```
+
+Redo join and plot
+
+```{r}
+
+varosok <- varosok %>%
+  left_join(park_varos, by = c("name" = "city")) %>% 
+  filter(!is.na(rank))
+
+#check again
+unmatched <- anti_join(park_varos, varosok, by = c("city" = "name"))
+unmatched #0 rows
+
+#plotting
+ggplot() +
+  geom_sf(data =world, fill = "#E5E5E5", color = "gray") +
+  coord_sf(
+    xlim = x_limits,
+    ylim = y_limits,
+    expand = FALSE) +
+  geom_point(data =varosok, aes(x = long, y = lat), alpha = 0.6, size = 1) +
+  geom_text_repel(data =varosok, aes(x = long, y = lat, label = rank), size = 3) +
+  theme_void()
+```
+
+Plot
+
+```{r}
+#highlight top 10 cities based on rank
+top10_parkvaros <- varosok %>% filter(rank <= 10) 
+
+#get the continuous var names
+continuous_vars <- varosok %>%
+  select(where(is.numeric)) %>%
+  select(-lat) %>% 
+  select(-long) %>% 
+  names()
+
+
+#plot maps for each continuous variable as size
+for (var in continuous_vars) {
+  pl <- ggplot() +
+    geom_sf(data = world, fill = "#E5E5E5", color = "gray") +
+    coord_sf(
+      xlim = x_limits,
+      ylim = y_limits,
+      expand = FALSE) +
+    geom_point(data = varosok, aes_string(x = "long", y = "lat", size = var), shape = 21, fill = "#320D6D") +
+    geom_point(data = top10_parkvaros, aes_string(x = "long", y = "lat", size = var), shape = 21, fill = "#FFD447") +
+    scale_size(name = var, range = c(1, 10)) +
+    theme_void()
+
+  print(pl)
+}
+
+
+```
+
+## Building the models
+
+```{r}
+#upon observing the maps rank seems to be most related to spend_per_resident
+model_simple <- lm(rank ~ spend_per_resident_data, data = parks)
+summary(model_simple)
+
+
+#include other vars as well to make a hierarchical regression
+model_complex <- lm(rank ~ med_park_size_data + park_pct_city_data + spend_per_resident_data + 
+                    playground_data + dogpark_data + basketball_data + rec_sr_data, data = parks)
+summary(model_complex)
+```
+
+##Diagnostics
+
+Influential outliers?
+
+```{r}
+
+#cooks distance plotted
+plot(model_simple, 4) 
+plot(model_complex, 4) #there are outliers
+
+
+cooks_simple <- cooks.distance(model_simple)
+influential_simple <- which(cooks_simple > (3 * mean(cooks_simple, na.rm = TRUE)))
+parks_tiszta_simple <- parks[-influential_simple, ] #2 influentials removed
+
+cooks_complex <- cooks.distance(model_complex)
+influential_complex <- which(cooks_complex > (3 * mean(cooks_complex, na.rm = TRUE)))
+parks_tiszta_complex <- parks[-influential_complex, ] #5 influentials removed
+
+#refit models
+model_simple2 <- lm(rank ~ spend_per_resident_data, data = parks_tiszta_simple)
+summary(model_simple2)
+
+model_complex2 <- lm(rank ~ med_park_size_data + park_pct_city_data + spend_per_resident_data + playground_data + dogpark_data + basketball_data + rec_sr_data, data = parks_tiszta_complex)
+summary(model_complex2)
+
+```
+
+
+Normality check
+
+```{r}
+plot(model_simple2, 2) #q-q plot
+shapiro.test(residuals(model_simple))
+
+plot(model_complex2, 2)
+shapiro.test(residuals(model_complex)) #this deviates significantly from normality, p = 0.01265
+```
+Linearity
+
+```{r}
+plot(model_simple2, 1)
+raintest(model_simple2)
+plot(model_complex2, 1)
+raintest(model_complex) #linearity assumption not met
+```
+
+
+Homoscedasticity check
+```{r}
+
+plot(model_simple2, 3)
+bptest(model_simple2)
+
+plot(model_complex2, 3)
+bptest(model_complex2) #ok, not significant
+
+```
+VIF
+```{r}
+library(car)
+vif(model_complex2) #no problematic multicollinearity
+```
+
+
+##Compare
+
+```{r}
+#compare the two
+AIC(model_simple)
+AIC(model_complex)
+AIC(model_simple2)
+AIC(model_complex2) #this seems to be best, but normality is violated
+anova(model_simple, model_complex)
+
+```
+
+```{r}
+#plot the relationship
+ggplot(parks, aes(x = spend_per_resident_data, y = rank)) +
+  geom_point() +
+  geom_smooth(method = "loess") +
+  labs(title = "Rank vs Spending per Resident")#seems to have a negative (as we assumed) non linear relationship, sigmoid
+
+```
+
+```{r}
+#log-transform rank
+parks$log_rank <- log(parks$rank)
+
+model_simple_log <- lm(log_rank ~ spend_per_resident_data, data = parks)
+summary(model_simple_log)
+
+model_complex_log <- lm(log_rank ~ med_park_size_data + park_pct_city_data + spend_per_resident_data + 
+                    playground_data + dogpark_data + basketball_data + rec_sr_data, data = parks)
+summary(model_complex_log)
+
+```
+```{r}
+#plot the relationship
+ggplot(parks, aes(x = spend_per_resident_data, y = log_rank)) +
+  geom_point() +
+  geom_smooth(method = "loess") +
+  labs(title = "LogRank vs Spending per resident")#seems to have a negative (as we assumed) non linear relationship
+```
+
+## Non linear regression
+
+```{r}
+nls_model <- nls(rank ~ SSlogis(spend_per_resident_data, phi_1, phi_2, phi_3), 
+      data = parks)
+
+summary(nls_model)
+```
+## Diagnostics for nls
+So I'm not an expert but I read visual inspection is the main form of assumption checks for nls, as it is more complex
+
+```{r}
+library(nlstools)
+nls_mod_diag <- nlsResiduals(nls_model)
+
+plot(nls_mod_diag, which = 1) #shape seems ok
+plot(nls_mod_diag, which = 3) #constant-variance assumption met
+plot(nls_mod_diag, which = 4)#no autocorrelation
+
+```
+## Discussion
+
+The logistic model successfully captured the relationship between **spending per resident** and **city rank**. The parameter estimates for the logistic model, using the **SSlogis** self-starting function, are as follows: **Asymptotic Rank (\(\phi_1\))**: The upper limit of the rank estimate is **102.82** (s.e. = **15.61**).  **Midpoint Spending per Resident (\(\phi_2\))**: The spending per resident value at the midpoint of the curve is **96.90** (s.e. = **15.56**).  **Inverse Growth Rate (\(\phi_3\))**: The rate of change (inverse sensitivity) in rank with respect to spending per resident is **-43.30** (s.e. = **8.37**).
+The model converged after **5 iterations**, with a residual standard error of **13.24** and 94 residual df. The model achieved a convergence tolerance of \(2.227 \times 10^{-6}\), indicating good model fit.
+
+The logistic model shows that higher spending per resident is associated with a lower city rank, which means better performance, but while increases in spending significantly improve rank at lower levels, the impact slows as spending approaches approximately 96.90 units, beyond which further increases yield minimal additional benefits.
